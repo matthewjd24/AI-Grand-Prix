@@ -1,10 +1,8 @@
 """Convert Unity gate-annotation JSON sidecars into YOLO-pose .txt labels.
 
-Before running:
-  - PNGs are in   dataset/images/<split>/
-  - JSON sidecars are in the SAME folder as their PNGs (copy them there)
-This writes        dataset/labels/<split>/<name>.txt   for EVERY image.
-Frames with no gates get an empty .txt (negative training examples).
+Layout (matches data.yaml):
+  - PNGs and JSON sidecars live together in the *Images folders below.
+  - This script writes a .txt next to every PNG. YOLO finds same-folder labels.
 
 Run:  c:\\python313\\python.exe convert.py
 """
@@ -13,12 +11,12 @@ import json
 import os
 import glob
 
-BASE = r"C:\Users\matt\Desktop\CNN\dataset"
+BASE = r"C:\Users\matt\Documents\GitHub\AI-Grand-Prix\Unity"
 
-# split name -> (images dir, labels dir).
+# split name -> image folder. Labels are written into the same folder.
 SPLITS = {
-    "train": (os.path.join(BASE, "images", "train"), os.path.join(BASE, "labels", "train")),
-    "val":   (os.path.join(BASE, "images", "val"),   os.path.join(BASE, "labels", "val")),
+    "train": os.path.join(BASE, "TrainingImages"),
+    "val":   os.path.join(BASE, "ValidationImages"),
 }
 
 CLASS_ID = 0  # single class: gate
@@ -77,19 +75,25 @@ def lines_for_json(json_path):
 
 
 def main():
-    for split, (img_dir, lbl_dir) in SPLITS.items():
+    for split, img_dir in SPLITS.items():
         if not os.path.isdir(img_dir):
             print(f"[skip] {split}: {img_dir} does not exist")
             continue
-        os.makedirs(lbl_dir, exist_ok=True)
 
         images = glob.glob(os.path.join(img_dir, "*.png"))
+
+        # Skip the whole split if every PNG already has a .txt next to it.
+        # Cheap idempotency: lets test.py call convert.main() unconditionally.
+        if images and all(os.path.exists(os.path.splitext(p)[0] + ".txt") for p in images):
+            print(f"[skip] {split}: all {len(images)} labels up to date")
+            continue
+
         written, empty, missing = 0, 0, 0
 
         for img in images:
             name = os.path.splitext(os.path.basename(img))[0]
             json_path = os.path.join(img_dir, name + ".json")
-            txt_path = os.path.join(lbl_dir, name + ".txt")
+            txt_path  = os.path.join(img_dir, name + ".txt")
 
             if os.path.exists(json_path):
                 lines = lines_for_json(json_path)
@@ -103,7 +107,7 @@ def main():
             if not lines:
                 empty += 1
 
-        print(f"[{split}] {written} labels written "
+        print(f"[{split}] {written} labels written into {img_dir} "
               f"({empty} empty/negative, {missing} images had no JSON)")
 
 

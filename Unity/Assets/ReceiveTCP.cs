@@ -45,7 +45,11 @@ public class ReceiveTCP : MonoBehaviour {
         while (_queue.TryDequeue(out var msg)) {
             var (topic, payload) = msg;
             if (topic == 1)
-                _model?.OnMessage(payload);
+                _model?.OnPose(payload);
+            else if (topic == 2)
+                _model?.OnGateCount(payload[0]);
+            else if (topic == 3)
+                _model?.OnAttitude(payload);
             OnMessageReceived?.Invoke(payload);
         }
     }

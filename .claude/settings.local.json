@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(conda run *)",
+      "Skill(anthropic-skills:pdf)",
+      "Skill(anthropic-skills:pdf:*)",
+      "Bash(python -c ' *)",
+      "Bash(pip show *)",
+      "Bash(pip install *)",
+      "Bash(python -c \"import torch; print\\(f'CUDA available: {torch.cuda.is_available\\(\\)}'\\); print\\(f'Device count: {torch.cuda.device_count\\(\\)}'\\); print\\(f'Device: {torch.cuda.get_device_name\\(0\\) if torch.cuda.is_available\\(\\) else \\\\\"CPU only\\\\\"}'\\)\")"
+    ]
+  }
+}

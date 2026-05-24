@@ -1,14 +1,17 @@
 # data.yaml — YOLO-pose config for drone-gate corner detection
 
-path: C:\Users\matt\Desktop\CNN\dataset   # dataset root
-train: images/train                       # relative to path
-val: images/val                           # relative to path
+path: C:\Users\matt\Documents\GitHub\AI-Grand-Prix\Unity
+train: TrainingImages
+val: ValidationImages
 
-# Keypoints: 4 corners per gate, 3 values each (x, y, visibility)
-kpt_shape: [4, 3]
+# Keypoints: 8 corners per gate (inner + outer), 3 values each (x, y, visibility)
+kpt_shape: [8, 3]
 
-# Corner order TL, TR, BL, BR. Horizontal flip swaps TL<->TR, BL<->BR.
-flip_idx: [1, 0, 3, 2]
+sigmas: [0.025, 0.025, 0.025, 0.025, 0.025, 0.025, 0.025, 0.025]  # inner stricter, outer looser
+
+# Corner order: TL, TR, BL, BR, TL_out, TR_out, BL_out, BR_out.
+# Horizontal flip swaps left<->right within each row (inner and outer).
+flip_idx: [1, 0, 3, 2, 5, 4, 7, 6]
 
 names:
   0: gate

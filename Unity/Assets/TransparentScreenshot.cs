@@ -1,5 +1,7 @@
 using System.IO;
+#if UNITY_EDITOR
 using UnityEditor;
+#endif
 using UnityEngine;
 
 public class TransparentScreenshot : MonoBehaviour {
@@ -59,6 +61,7 @@ public class TransparentScreenshot : MonoBehaviour {
     }
 }
 
+#if UNITY_EDITOR
 [CustomEditor(typeof(TransparentScreenshot))]
 public class TransparentScreenshotButton : Editor {
     public override void OnInspectorGUI() {
@@ -69,3 +72,4 @@ public class TransparentScreenshotButton : Editor {
         }
     }
 }
+#endif

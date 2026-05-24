@@ -1,12 +1,12 @@
 """
-brain.py — autonomous gate-racing controller.
+brain.py — top-level orchestrator.
 
-Receives the vision stream from the sim, detects gates with the CNN,
-and sends MAVLink position targets to the SITL bridge.
+Wires together: vision (perception) → world_building (state) → route_planner
+(decision) → flight_control (action). Also keeps heartbeats alive and pumps
+the debug Unity stream.
 """
 
-import glob
-import random
+import asyncio
 import socket
 import struct
 import sys
@@ -14,191 +14,210 @@ import time
 
 import cv2
 import numpy as np
-from pymavlink import mavutil
 
 sys.path.insert(0, "CNN Gate Detection")
-import predict
+import log_dir   # noqa: F401  (import early so the run folder is created first)
+_t_import = time.time()
+print("[brain] loading YOLO gate-detector model...")
+import predict   # noqa: F401  (loaded so vision can find it)
+print(f"[brain] model loaded in {time.time()-_t_import:.2f}s")
 import vision
+import world_building
+import flight_control
+import route_planner
 
 # --- Config ------------------------------------------------------------------
-BRIDGE_HOST = "127.0.0.1"
-BRIDGE_PORT  = 14550
-
 UNITY_HOST = "127.0.0.1"
 UNITY_PORT = 9000
 
 HEARTBEAT_HZ = 1
 COMMAND_HZ   = 10
 
-SECONDS_PER_WAYPOINT = 3.5
-LOOP_WAYPOINTS = True
-
-# UDP pose protocol (topic 1)
-# payload: object_id (uint8) | px py pz (3×float32 LE) | qx qy qz qw (4×float32 LE)
-TOPIC_POSE   = 1
-_POSE_FORMAT = "<B3f4f"   # 29 bytes
-
-# --- Pre-written flight path (NED frame: z negative = up) --------------------
-WAYPOINTS = [
-    ( 0.0,  0.0, -1.0),
-    ( 0.0,  0.0, -1.0),
-    ( 1.0,  0.0, -1.0),
-    ( 1.0,  1.0, -1.0),
-    ( 0.0,  1.0, -1.0),
-    ( 0.0,  0.0, -1.0),
-    ( 0.0,  0.0, -2.0),
-    ( 2.0,  0.0, -2.0),
-]
+# UDP pose protocol
+TOPIC_POSE     = 1   # per-gate pose:  object_id (u8) | px py pz (3xf32) | qx qy qz qw (4xf32)
+TOPIC_COUNT    = 2   # gate count:     count (u8)
+TOPIC_ATTITUDE = 3   # drone attitude: qx qy qz qw (4xf32, Unity-frame quaternion)
+_POSE_FORMAT     = "<B3f4f"   # 29 bytes
+_ATTITUDE_FORMAT = "<4f"      # 16 bytes
 
 
-# --- MAVLink connection -------------------------------------------------------
-print(f"[brain] Connecting to bridge at {BRIDGE_HOST}:{BRIDGE_PORT}...")
-conn = mavutil.mavlink_connection(f"udpout:{BRIDGE_HOST}:{BRIDGE_PORT}")
-
+# --- Unity comms -------------------------------------------------------------
 _udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
 
 def send_unity_heartbeat():
     _udp.sendto(b"heartbeat", (UNITY_HOST, UNITY_PORT))
 
+
 def send_pose(object_id, px, py, pz, qx=0.0, qy=0.0, qz=0.0, qw=1.0):
     payload = struct.pack(_POSE_FORMAT, object_id, px, py, pz, qx, qy, qz, qw)
     _udp.sendto(bytes([TOPIC_POSE]) + payload, (UNITY_HOST, UNITY_PORT))
-    print("Sent pose")
 
 
-def _opencv_to_unity(tvec, rvec):
-    """Convert pose from OpenCV camera frame to Unity coordinate frame.
-    OpenCV: right-handed, x right, y down, z forward
-    Unity:  left-handed, x right, y up,   z forward
-    Conversion: negate y on position; apply reflection to rotation.
-    """
-    tx, ty, tz = tvec.flatten()
-    # flip y
-    t_unity = (tx, -ty, tz)
-
-    R, _ = cv2.Rodrigues(rvec)
-    M = np.diag([1, -1, 1]).astype(np.float64)
-    R_unity = M @ R @ M
-    # convert rotation matrix to quaternion
-    trace = R_unity[0,0] + R_unity[1,1] + R_unity[2,2]
-    if trace > 0:
-        s = 0.5 / np.sqrt(trace + 1.0)
-        q = (R_unity[2,1]-R_unity[1,2])*s, (R_unity[0,2]-R_unity[2,0])*s, (R_unity[1,0]-R_unity[0,1])*s, 0.25/s
-    elif R_unity[0,0] > R_unity[1,1] and R_unity[0,0] > R_unity[2,2]:
-        s = 2.0 * np.sqrt(1.0 + R_unity[0,0] - R_unity[1,1] - R_unity[2,2])
-        q = 0.25*s, (R_unity[0,1]+R_unity[1,0])/s, (R_unity[0,2]+R_unity[2,0])/s, (R_unity[2,1]-R_unity[1,2])/s
-    elif R_unity[1,1] > R_unity[2,2]:
-        s = 2.0 * np.sqrt(1.0 + R_unity[1,1] - R_unity[0,0] - R_unity[2,2])
-        q = (R_unity[0,1]+R_unity[1,0])/s, 0.25*s, (R_unity[1,2]+R_unity[2,1])/s, (R_unity[0,2]-R_unity[2,0])/s
-    else:
-        s = 2.0 * np.sqrt(1.0 + R_unity[2,2] - R_unity[0,0] - R_unity[1,1])
-        q = (R_unity[0,2]+R_unity[2,0])/s, (R_unity[1,2]+R_unity[2,1])/s, 0.25*s, (R_unity[1,0]-R_unity[0,1])/s
-    return t_unity, q
+def send_gate_count(count):
+    _udp.sendto(bytes([TOPIC_COUNT, count]), (UNITY_HOST, UNITY_PORT))
 
 
-def send_gate_poses(gates):
-    for i, gate in enumerate(gates):
-        if gate["pose"] is None:
-            continue
-        (tx, ty, tz), (qx, qy, qz, qw) = _opencv_to_unity(gate["pose"]["tvec"], gate["pose"]["rvec"])
+def send_gate_poses_to_unity():
+    tracks = world_building.get_smoothed_tracks()
+    send_gate_count(len(tracks))
+    for i, track in enumerate(tracks):
+        (tx, ty, tz), (qx, qy, qz, qw) = _ned_to_unity(track["tvec"], track["rvec"])
         send_pose(i, tx, ty, tz, qx, qy, qz, qw)
 
-def send_mav_heartbeat():
-    conn.mav.heartbeat_send(
-        mavutil.mavlink.MAV_TYPE_QUADROTOR,
-        mavutil.mavlink.MAV_AUTOPILOT_GENERIC,
-        0, 0, 0
-    )
 
-def send_position_target(x_ned, y_ned, z_ned):
-    type_mask = 0b0000111111111000
-    conn.mav.set_position_target_local_ned_send(
-        0, 1, 1,
-        mavutil.mavlink.MAV_FRAME_LOCAL_NED,
-        type_mask,
-        x_ned, y_ned, z_ned,
-        0, 0, 0,
-        0, 0, 0,
-        0, 0
-    )
+def send_attitude_to_unity(roll, pitch, yaw):
+    R_ned = _R_ned_from_ypr(roll, pitch, yaw)
+    qx, qy, qz, qw = _R_ned_to_unity_quat(R_ned)
+    payload = struct.pack(_ATTITUDE_FORMAT, qx, qy, qz, qw)
+    _udp.sendto(bytes([TOPIC_ATTITUDE]) + payload, (UNITY_HOST, UNITY_PORT))
 
-def current_waypoint(t_seconds):
-    total_index = t_seconds / SECONDS_PER_WAYPOINT
-    if LOOP_WAYPOINTS:
-        i      = int(total_index) % len(WAYPOINTS)
-        next_i = (i + 1) % len(WAYPOINTS)
+
+# --- World transform: NED world frame → Unity coordinates --------------------
+# NED world (right-handed): X-North, Y-East, Z-Down.
+# Unity (left-handed):      X-right, Y-up,  Z-forward.
+# Mapping: Unity X = NED Y (east → right),  Unity Y = -NED Z (down → up),
+#          Unity Z = NED X (north → forward).
+_P_UNITY_FROM_NED = np.array([
+    [0, 1,  0],
+    [0, 0, -1],
+    [1, 0,  0],
+], dtype=np.float64)
+
+# Our PnP gate frame has +Z as the normal (out of the face), but the Unity
+# gate prefab uses +X as its forward axis. Rotate +90° about gate-Y so the
+# prefab's front lines up with the detected gate's normal.
+_R_PREFAB_FIX = np.array([
+    [ 0, 0, 1],
+    [ 0, 1, 0],
+    [-1, 0, 0],
+], dtype=np.float64)
+
+
+def _ned_to_unity(tvec, rvec):
+    t_unity  = _P_UNITY_FROM_NED @ np.asarray(tvec).flatten()
+    R_ned, _ = cv2.Rodrigues(rvec)
+    R_ned_prefab = R_ned @ _R_PREFAB_FIX
+    q = _R_ned_to_unity_quat(R_ned_prefab)
+    tx, ty, tz = t_unity
+    return (tx, ty, tz), q
+
+
+def _R_ned_from_ypr(roll, pitch, yaw):
+    """Aerospace ZYX intrinsic — body-NED → world-NED rotation matrix."""
+    cr, sr = np.cos(roll), np.sin(roll)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    return np.array([
+        [cy*cp, cy*sp*sr - sy*cr, cy*sp*cr + sy*sr],
+        [sy*cp, sy*sp*sr + cy*cr, sy*sp*cr - cy*sr],
+        [-sp,   cp*sr,            cp*cr           ],
+    ], dtype=np.float64)
+
+
+def _R_ned_to_unity_quat(R_ned):
+    """Basis-change an NED rotation matrix into Unity coords and return (qx,qy,qz,qw)."""
+    R = _P_UNITY_FROM_NED @ R_ned @ _P_UNITY_FROM_NED.T
+    trace = R[0,0] + R[1,1] + R[2,2]
+    if trace > 0:
+        s = 0.5 / np.sqrt(trace + 1.0)
+        return (R[2,1]-R[1,2])*s, (R[0,2]-R[2,0])*s, (R[1,0]-R[0,1])*s, 0.25/s
+    elif R[0,0] > R[1,1] and R[0,0] > R[2,2]:
+        s = 2.0 * np.sqrt(1.0 + R[0,0] - R[1,1] - R[2,2])
+        return 0.25*s, (R[0,1]+R[1,0])/s, (R[0,2]+R[2,0])/s, (R[2,1]-R[1,2])/s
+    elif R[1,1] > R[2,2]:
+        s = 2.0 * np.sqrt(1.0 + R[1,1] - R[0,0] - R[2,2])
+        return (R[0,1]+R[1,0])/s, 0.25*s, (R[1,2]+R[2,1])/s, (R[0,2]-R[2,0])/s
     else:
-        i      = min(int(total_index), len(WAYPOINTS) - 1)
-        next_i = min(i + 1, len(WAYPOINTS) - 1)
-    alpha = total_index - int(total_index)
-    a, b  = WAYPOINTS[i], WAYPOINTS[next_i]
-    return i, tuple(a[k] + (b[k] - a[k]) * alpha for k in range(3))
-
-def _smoke_test():
-    val_images = [
-        p for p in glob.glob(r"CNN Gate Detection\dataset\images\val\*.png")
-        if open(p.replace("images", "labels").replace(".png", ".txt")).read().strip()
-    ]
-    if not val_images:
-        print("[brain] smoke test: no val images found, skipping")
-        return
-    img = cv2.imread(random.choice(val_images))
-    gates, annotated = predict.detect(img)
-    print(f"[brain] smoke test: {len(gates)} gate(s) detected")
-    for g in gates:
-        print(f"        keypoints: {g['keypoints'].tolist()}")
-        print(f"        conf:      {g['keypoint_conf'].tolist()}")
-        if g["pose"]:
-            R, _ = cv2.Rodrigues(g["pose"]["rvec"])
-            print(f"        d={g['pose']['distance']:.2f}m  tvec={g['pose']['tvec'].flatten()}  R={R}")
-    send_gate_poses(gates)
-    cv2.imshow("vision", annotated)
-    cv2.waitKey(1)
+        s = 2.0 * np.sqrt(1.0 + R[2,2] - R[0,0] - R[1,1])
+        return (R[0,2]+R[2,0])/s, (R[1,2]+R[2,1])/s, 0.25*s, (R[1,0]-R[0,1])/s
 
 
-def main():
-    _smoke_test()
+# --- Main loop ---------------------------------------------------------------
+async def main():
+    t_start = time.time()
+    def step(msg):
+        print(f"[brain] +{time.time()-t_start:5.2f}s  {msg}")
+
+    step("connecting to flight controller (MAVSDK)...")
+    await flight_control.connect()
+    step("starting flight control telemetry...")
+    await flight_control.start()
+    step("starting vision UDP listener...")
     vision.start()
+    step("starting world_building thread...")
+    world_building.start()
+    step("creating cv2 window...")
+    cv2.namedWindow("vision", cv2.WINDOW_NORMAL)
+    step("startup complete.")
 
-    print(f"[brain] {len(WAYPOINTS)} waypoints. {'Looping.' if LOOP_WAYPOINTS else 'One pass.'}")
+    print(f"[brain] Mode: {route_planner.MODE}")
     print("[brain] Ctrl+C to stop.")
 
-    start          = time.time()
-    last_heartbeat = 0.0
-    last_command   = 0.0
-    last_index     = -1
+    t0                  = time.time()
+    last_heartbeat      = 0.0
+    last_command        = 0.0
+    last_attitude_print = 0.0
+    video_writer        = None   # lazily created once we see the first frame
 
-    while True:
-        _, gates, annotated = vision.get_latest()
-        send_gate_poses(gates)
-        if annotated is not None:
-            cv2.imshow("vision", annotated)
-        cv2.waitKey(1)
-        time.sleep(0.01)
+    try:
+        while True:
+            now     = time.time()
+            elapsed = now - t0
 
-    # try:
-    #     while True:
-    #         now     = time.time()
-    #         elapsed = now - start
+            # Heartbeat
+            if now - last_heartbeat >= 1.0 / HEARTBEAT_HZ:
+                send_unity_heartbeat()
+                last_heartbeat = now
 
-    #         if now - last_heartbeat >= 1.0 / HEARTBEAT_HZ:
-    #             send_mav_heartbeat()
-    #             send_unity_heartbeat()
-    #             last_heartbeat = now
+            # Print attitude and send to unity
+            if now - last_attitude_print >= 0.1:
+                att = flight_control.get_attitude()
+                if att is not None:
+                    r, p, y, *_ = att
+                    send_attitude_to_unity(r, p, y)
+                    print(f"[brain] attitude: roll={np.degrees(r):+6.1f}°  pitch={np.degrees(p):+6.1f}°  yaw={np.degrees(y):+6.1f}°")
+                else:
+                    print("[brain] attitude: <none yet>")
+                last_attitude_print = now
 
-    #         if now - last_command >= 1.0 / COMMAND_HZ:
-    #             index, (x, y, z) = current_waypoint(elapsed)
-    #             send_position_target(x, y, z)
-    #             last_command = now
+            # Send commands to the drone
+            if now - last_command >= 1.0 / COMMAND_HZ:
+                x, y, z, yaw = route_planner.current_target(elapsed)
+                if yaw is None:
+                    await flight_control.send_position(x, y, z)
+                else:
+                    await flight_control.send_position_yaw(x, y, z, yaw)
+                last_command = now
 
-    #             if index != last_index:
-    #                 print(f"[brain] t={elapsed:5.1f}s  waypoint {index}/{len(WAYPOINTS)-1} "
-    #                       f"-> ({x:+.2f}, {y:+.2f}, {z:+.2f}) NED")
-    #                 last_index = index
+            send_gate_poses_to_unity()
+            raw_frame, _, annotated_frame = vision.get_latest()
+            if annotated_frame is not None:
+                frame = annotated_frame
+            else:
+                frame = raw_frame
+            if frame is not None:
+                frame = frame.copy()
+                cv2.putText(frame, f"t={elapsed:6.2f}s", (10, 25),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+                if video_writer is None:
+                    h, w = frame.shape[:2]
+                    video_path = log_dir.log_path("vision.mp4")
+                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                    video_writer = cv2.VideoWriter(video_path, fourcc, 30.0, (w, h))
+                    print(f"[brain] recording video to {video_path}")
+                video_writer.write(frame)
+                cv2.imshow("vision", frame)
+            cv2.waitKey(1)
 
-    #         time.sleep(0.01)
+            await asyncio.sleep(0.01)
 
-    # except KeyboardInterrupt:
-    #     print("\n[brain] Stopped.")
+    except KeyboardInterrupt:
+        print("\n[brain] Stopped.")
+    finally:
+        if video_writer is not None:
+            video_writer.release()
+            print("[brain] video saved.")
 
-main()
+
+asyncio.run(main())
