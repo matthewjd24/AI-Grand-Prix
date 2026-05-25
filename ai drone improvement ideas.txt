@@ -1,0 +1,3 @@
+increase imgsz to 1280, increases inference time though. turn multi_scale off if you do this.
+increase yolo11n to yolo11s. also increases inference 2x
+mix anti aliasing on/off

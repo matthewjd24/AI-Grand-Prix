@@ -28,7 +28,7 @@ import vision
 # --- Tuning constants -------------------------------------------------------
 UPDATE_HZ        = 30     # how many times per second we update the world
 HISTORY_SECONDS  = 0.5    # samples older than this are dropped
-MATCH_DISTANCE   = 1.5    # detections within this many metres = same gate
+MATCH_DISTANCE   = 2.5    # detections within this many metres = same gate
 SMOOTH_LAMBDA    = 3      # higher = older samples count less in averages
 
 # --- Camera → body rotation matrix (spec §3.8) ------------------------------
@@ -62,8 +62,11 @@ _last_seen_frame_id = -1
 _lock               = threading.Lock()
 
 # --- Logging setup ----------------------------------------------------------
-_log_file   = log_dir.open_log()   # → world_building.jsonl
-_start_time = time.time()
+# Two files per run:
+#   world_building.jsonl — full track history per gate (existing)
+#   world_state.jsonl    — current smoothed pose per gate, quaternion form
+_log_file       = log_dir.open_log()                                           # → world_building.jsonl
+_state_log_file = open(log_dir.log_path("world_state.jsonl"), "w", buffering=1)
 
 # ============================================================================
 # Public API
@@ -143,8 +146,9 @@ def update_model():
     # Fold them into the persistent track list.
     now = time.time()
     with _lock:
-        _absorb_detections(detections, now)
+        _add_new_gate_positions_to_tracks(detections, now)
         _log_tracks(now)
+        _log_current_state(now)
 
 # ============================================================================
 # Camera frame → world frame
@@ -199,19 +203,19 @@ def _apply_world_transform(tvec_cam, rvec_cam, R_world_from_camera):
 # ============================================================================
 # Track management — match, create, prune, drop
 # ============================================================================
-def _absorb_detections(detections, now):
+def _add_new_gate_positions_to_tracks(detections, now):
     """Update the track list with this frame's detections."""
-    matched_pairs, unmatched_indices = _match_detections(detections)
+    matched_pairs, unmatched_indices = _match_new_gate_positions_to_tracks(detections)
 
-    # Track all the IDs that got a detection this frame (new or existing).
+    # Track all the IDs that got a detection this frame (new or existing)
     fresh_track_ids = set()
 
-    # For each detection that matched an existing track, append a new sample.
+    # For each detection that matched an existing track, append
     for detection_index, track_index in matched_pairs:
         _append_sample(_tracks[track_index], detections[detection_index], now)
         fresh_track_ids.add(_tracks[track_index]["id"])
 
-    # For each detection that didn't match anything, start a new track.
+    # For each detection that didn't match anything, start a new track
     for detection_index in unmatched_indices:
         new_id = _create_track(detections[detection_index], now)
         fresh_track_ids.add(new_id)
@@ -219,7 +223,7 @@ def _absorb_detections(detections, now):
     _prune_old_samples(now)
     _drop_unseen_tracks(fresh_track_ids)
 
-def _match_detections(detections):
+def _match_new_gate_positions_to_tracks(detections):
     """Pair each detection with the closest existing track within
     MATCH_DISTANCE metres. Each track can match at most one detection.
     Returns (matched_pairs, unmatched_detection_indices)."""
@@ -228,7 +232,7 @@ def _match_detections(detections):
     claimed_detections = set()
 
     for detection_index, detection in enumerate(detections):
-        track_index = _nearest_unclaimed_track(detection["tvec"], claimed_tracks)
+        track_index = _find_closest_unclaimed_track(detection["tvec"], claimed_tracks)
         if track_index is None:
             continue
         matched_pairs.append((detection_index, track_index))
@@ -241,13 +245,13 @@ def _match_detections(detections):
             unmatched_indices.append(i)
     return matched_pairs, unmatched_indices
 
-def _nearest_unclaimed_track(tvec, claimed_tracks):
+def _find_closest_unclaimed_track(tvec, claimed_track_indices):
     """Find the index of the closest unclaimed track. Returns None if no
     track is within MATCH_DISTANCE metres."""
     best_index    = None
     best_distance = MATCH_DISTANCE
     for i, track in enumerate(_tracks):
-        if i in claimed_tracks:
+        if i in claimed_track_indices:
             continue
         last_known_tvec = track["history"][-1]["tvec"]
         distance        = float(np.linalg.norm(tvec - last_known_tvec))
@@ -398,18 +402,66 @@ def _log_tracks(now):
         history_json = []
         for sample in track["history"]:
             history_json.append({
-                "t":       round(sample["t"] - _start_time, 4),
+                "t":       round(sample["t"] - log_dir.START_TIME, 4),
                 "tvec":    [round(float(c), 4) for c in sample["tvec"]],
                 "rvec":    [round(float(c), 4) for c in sample["rvec"].flatten()],
                 "partial": sample["partial"],
             })
         tracks_json.append({
             "id":        track["id"],
-            "last_seen": round(track["last_seen"] - _start_time, 4),
+            "last_seen": round(track["last_seen"] - log_dir.START_TIME, 4),
             "history":   history_json,
         })
     snapshot = {
-        "t":      round(now - _start_time, 4),
+        "t":      round(now - log_dir.START_TIME, 4),
         "tracks": tracks_json,
     }
-    _log_file.write(json.dumps(snapshot) + "\n")
+    _log_file.write(json.dumps(snapshot, indent=2) + "\n")
+
+
+def _log_current_state(now):
+    """Write the current SMOOTHED pose per gate to world_state.jsonl.
+    Position as Cartesian (NED metres) and rotation as aerospace ZYX Euler
+    angles (roll, pitch, yaw, degrees). Only gates with enough history to
+    smooth are included."""
+    gates_json = []
+    for track in _tracks:
+        if len(track["history"]) < 2:
+            continue
+        smoothed_position = _smooth_position(track["history"], now)
+        smoothed_rotation = _smooth_rotation(track["history"], now)
+        roll_deg, pitch_deg, yaw_deg = _rvec_to_euler_deg(smoothed_rotation)
+        gates_json.append({
+            "id":       track["id"],
+            "position": {
+                "x": round(float(smoothed_position[0]), 4),
+                "y": round(float(smoothed_position[1]), 4),
+                "z": round(float(smoothed_position[2]), 4),
+            },
+            "euler_deg": {
+                "roll":  round(roll_deg,  2),
+                "pitch": round(pitch_deg, 2),
+                "yaw":   round(yaw_deg,   2),
+            },
+        })
+    snapshot = {
+        "t":     round(now - log_dir.START_TIME, 4),
+        "gates": gates_json,
+    }
+    _state_log_file.write(json.dumps(snapshot, indent=2) + "\n")
+
+
+def _rvec_to_euler_deg(rvec):
+    """Convert a Rodrigues rotation vector to aerospace ZYX Euler angles
+    (roll, pitch, yaw) in degrees."""
+    R, _ = cv2.Rodrigues(rvec)
+    # Standard ZYX decomposition.
+    pitch = np.arcsin(-np.clip(R[2, 0], -1.0, 1.0))
+    if abs(R[2, 0]) < 0.999999:
+        roll = np.arctan2(R[2, 1], R[2, 2])
+        yaw  = np.arctan2(R[1, 0], R[0, 0])
+    else:
+        # Gimbal lock — pitch near ±90°. Roll becomes ambiguous; conventionally set to 0.
+        roll = 0.0
+        yaw  = np.arctan2(-R[0, 1], R[1, 1])
+    return float(np.degrees(roll)), float(np.degrees(pitch)), float(np.degrees(yaw))

@@ -41,8 +41,23 @@ def lines_for_json(json_path):
                 kpts.append((0.0, 0.0, 0))      # 0 = not labeled
                 continue
             x, y = float(c["x"]), float(c["y"])
-            # YOLO visibility: 2 = visible, 1 = labeled but occluded/offscreen
-            v = 2 if c.get("visible", False) else 1
+            # YOLO visibility:
+            #   2 = visible and labeled — supervise position fully
+            #   1 = labeled but occluded — supervise position (visual content occluded but pixel known)
+            #   0 = not labeled — DO NOT supervise position (model gets no gradient)
+            # Off-screen corners get 0: their pixel coords would be hundreds of
+            # pixels outside image bounds, which the YOLO regression head can't
+            # physically output. Training with v=1 here just teaches the model
+            # to predict the image edge with high confidence on every off-screen
+            # corner — exactly the bug we're trying to fix.
+            on_screen = c.get("onScreen", False)
+            visible   = c.get("visible",  False)
+            if on_screen and visible:
+                v = 2
+            elif on_screen:
+                v = 1   # on-screen but occluded by something — keep supervision
+            else:
+                v = 0   # off-screen → don't supervise
             kpts.append((x / W, y / H, v))
             if c.get("onScreen", False):
                 xs.append(x)

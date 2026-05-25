@@ -135,26 +135,50 @@ def _R_ned_to_unity_quat(R_ned):
 
 # --- Main loop ---------------------------------------------------------------
 async def main():
-    t_start = time.time()
     def step(msg):
-        print(f"[brain] +{time.time()-t_start:5.2f}s  {msg}")
+        print(f"[brain] t={log_dir.elapsed():6.2f}s  {msg}")
 
     step("connecting to flight controller (MAVSDK)...")
     await flight_control.connect()
     step("starting flight control telemetry...")
     await flight_control.start()
+    step("warming up YOLO model (load + first CUDA inference)...")
+    predict.warmup()
     step("starting vision UDP listener...")
     vision.start()
     step("starting world_building thread...")
     world_building.start()
     step("creating cv2 window...")
     cv2.namedWindow("vision", cv2.WINDOW_NORMAL)
-    step("startup complete.")
+
+    # Block until we've actually received and processed a frame from the sim.
+    # Otherwise the command loop starts firing position targets while the
+    # drone is "flying blind" with no vision data.
+    step("waiting for first camera frame from sim...")
+    wait_start = time.time()
+    while True:
+        _, frame_id = vision.get_detections()
+        if frame_id > 0:
+            break
+        if time.time() - wait_start > 30.0:
+            print("[brain] WARN: no frame after 30s — sim might not be running. Proceeding anyway.")
+            break
+        await asyncio.sleep(0.05)
+    step(f"first frame received (frame_id={frame_id})")
+
+    # Prime offboard mode here, not inside the main loop. The first
+    # send_position() triggers MAVSDK's offboard.start() handshake which can
+    # take several seconds (often times out the first attempt). Doing it now
+    # means the main loop never has to pay that cost on the critical path —
+    # otherwise the loop blocks here and video_writer init / vision display
+    # are delayed by the same amount.
+    step("priming offboard mode (first send_position can take a moment)...")
+    await flight_control.send_position(0.0, 0.0, 0.0)
+    step("offboard primed — entering command loop.")
 
     print(f"[brain] Mode: {route_planner.MODE}")
-    print("[brain] Ctrl+C to stop.")
 
-    t0                  = time.time()
+    t0                  = log_dir.START_TIME
     last_heartbeat      = 0.0
     last_command        = 0.0
     last_attitude_print = 0.0
@@ -176,9 +200,9 @@ async def main():
                 if att is not None:
                     r, p, y, *_ = att
                     send_attitude_to_unity(r, p, y)
-                    print(f"[brain] attitude: roll={np.degrees(r):+6.1f}°  pitch={np.degrees(p):+6.1f}°  yaw={np.degrees(y):+6.1f}°")
-                else:
-                    print("[brain] attitude: <none yet>")
+                    #print(f"[brain] attitude: roll={np.degrees(r):+6.1f}°  pitch={np.degrees(p):+6.1f}°  yaw={np.degrees(y):+6.1f}°")
+                # else:
+                #     print("[brain] attitude: <none yet>")
                 last_attitude_print = now
 
             # Send commands to the drone

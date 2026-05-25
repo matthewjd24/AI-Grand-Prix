@@ -14,12 +14,23 @@ Example:
 
 import os
 import sys
+import time
 from datetime import datetime
 
 # Create the per-run directory once, at import time.
 RUN_DIR = os.path.join("logs", f"run_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}")
 os.makedirs(RUN_DIR, exist_ok=True)
 print(f"[log_dir] Run logs → {RUN_DIR}")
+
+# Shared start time for all logs/timestamps across the whole project.
+# Other modules should use `log_dir.START_TIME` instead of their own time.time()
+# captured at import — that way every script reports the same elapsed seconds.
+START_TIME = time.time()
+
+def elapsed():
+    """Seconds since the run started. Use this everywhere instead of subtracting
+    a per-module _start_time so all logs share one time origin."""
+    return time.time() - START_TIME
 
 def open_log(extension="jsonl", mode="w", buffering=1):
     """Open a log file inside this run's folder, named after the calling script.

@@ -13,6 +13,7 @@ using System.Reflection;
 public class Randomizer : MonoBehaviour {
     TrainingImageQuality qualityControl;
     TrainingLabelWriter labelWriter;
+    KeypointVisualizer keyViz;
 
     [Header("References")]
     [Tooltip("All gates in the pool. Disabled gates are hidden; enabled are visible.")]
@@ -22,6 +23,15 @@ public class Randomizer : MonoBehaviour {
     public List<Renderer> gateRenderers = new List<Renderer>();
 
     public Image bgImage;
+
+    [Tooltip("Parent GameObject of the simulated horizon. First child = sky (top), " +
+             "second child = ground (bottom). Both must have an Image component. " +
+             "Randomized with sky/ground colors, vertical horizon position, and rotation " +
+             "when the horizon background is chosen.")]
+    public RectTransform horizonRoot;
+
+    [Tooltip("Background type probabilities. Must sum to 1.0. Order: solidColor, cocoImage, horizon.")]
+    public Vector3 backgroundProbabilities = new Vector3(0.20f, 0.55f, 0.25f);
 
     [Tooltip("The origin point the cone extends from (usually the camera).")]
     public Transform coneOrigin;
@@ -58,6 +68,12 @@ public class Randomizer : MonoBehaviour {
              "is guaranteed inside the viewport. 0.25 = up to a quarter of the gate may clip.")]
     [Range(0f, 1f)]
     public float allowedClipFraction = 0f;
+
+    [Tooltip("Power applied to a uniform random sample before mapping to distance, " +
+             "biasing placement toward minDistance. 1 = uniform, 2 = mild close bias, " +
+             "2.5-3 = strong close bias, 4+ = very aggressive.")]
+    [Range(0.5f, 5f)]
+    public float distanceBiasExponent = 2.5f;
 
     [Header("Rotation Parameters")]
     [Range(0f, 180f)] public float maxYawDeviation = 60f;
@@ -107,6 +123,47 @@ public class Randomizer : MonoBehaviour {
     public int framesPerPause = 2000;
     [Tooltip("How long the batch pauses each time it hits a framesPerPause boundary, in seconds.")]
     public float pauseSeconds = 10f;
+
+    [Header("Blur Augmentation")]
+    [Tooltip("How often each saved image gets a randomized blur applied. Helps " +
+             "the model become invariant to renderer anti-aliasing differences.")]
+    [Range(0f, 1f)]
+    public float blurAugmentProbability = 0.7f;
+
+    [Tooltip("Downscale factor used when blur is applied (1 = none). Larger = " +
+             "blurrier. 2 is mild, 3 is moderate, 4+ destroys corner localization.")]
+    [Range(1, 5)]
+    public int blurDownscale = 2;
+
+    [Tooltip("Max random subpixel offset (in pixels) applied before downscale. " +
+             "Randomizes where the aliasing pattern lands, so jaggies look different " +
+             "from image to image rather than always aligning the same way.")]
+    [Range(0f, 1.5f)]
+    public float blurJitterPixels = 0.7f;
+
+    [Tooltip("Max extra blur passes (0-3). Each pass is another downsample-upsample " +
+             "round, smoothing the falloff curve further. Randomized per image. " +
+             "Keep low (0 or 1) — stacked passes destroy corner localization.")]
+    [Range(0, 3)]
+    public int blurMaxExtraPasses = 1;
+
+    [Tooltip("Probability that an image gets a JAGGED (aliased) augmentation instead " +
+             "of (or as well as) blur. Uses nearest-neighbor downscale-upscale to fake " +
+             "the hard pixel boundaries you see from non-AA renderers like PyBullet.")]
+    [Range(0f, 1f)]
+    public float jaggedAugmentProbability = 0.4f;
+
+    [Tooltip("Downscale factor used when jagged pixelation is applied (1 = none). " +
+             "Larger = blockier. 2 is mild, 3 is moderate, 4+ destroys corner subpixel info.")]
+    [Range(1, 5)]
+    public int jaggedDownscale = 2;
+
+    [Tooltip("Max random subpixel offset (in pixels) applied before the jagged " +
+             "downscale. Shifts where the pixel grid aligns, so the stair-step " +
+             "pattern differs across images within the same downscale strength.")]
+    [Range(0f, 1.5f)]
+    public float jaggedJitterPixels = 0.7f;
+
 
     [Header("Saving")]
     [Tooltip("Absolute path where pass screenshots are saved. Must be writable. " +
@@ -223,12 +280,13 @@ public class Randomizer : MonoBehaviour {
             return;
         }
 
+        if (keyViz == null) keyViz = GetComponent<KeypointVisualizer>();
+
         // Wipe last frame's keypoint overlays so a rejected frame doesn't leave
         // stale markers from the previous accepted frame.
-        FindObjectOfType<KeypointVisualizer>()?.Hide();
 
         if (qualityControl == null) qualityControl = GetComponent<TrainingImageQuality>();
-        if (labelWriter   == null) labelWriter   = GetComponent<TrainingLabelWriter>();
+        if (labelWriter == null) labelWriter   = GetComponent<TrainingLabelWriter>();
         labelWriter.Clear();
 
 #if UNITY_EDITOR
@@ -251,11 +309,13 @@ public class Randomizer : MonoBehaviour {
         if (passed != null && passed.Count > 0) {
             labelWriter.WriteAll(passed, Camera.main);
             SaveTrainingFrame(passed);
-            //Debug.Log("Frame passed");
-            //if (!Application.isPlaying) GetComponent<KeypointVisualizer>().ShowLatestKeypoints();
+            if (!Application.isPlaying) {
+                Debug.Log("Frame passed");
+                GetComponent<KeypointVisualizer>().ShowLatestKeypoints();
+            }
         }
-        else {
-            //Debug.Log("Frame didn't pass QC");
+        else if (!Application.isPlaying) {
+                Debug.Log("Frame didn't pass QC");
         }
 
     }
@@ -291,6 +351,46 @@ public class Randomizer : MonoBehaviour {
 
         cam.targetTexture = rt;
         cam.Render();
+
+        // Randomized blur to simulate varied renderer anti-aliasing (soft side).
+        // Single fixed downscale, applied with probability blurAugmentProbability.
+        //   - subpixel jitter  → randomizes where aliasing lands per image
+        //   - extra passes     → additional smoothing rounds for variety
+        bool applyBlur = blurDownscale > 1 && Random.value < blurAugmentProbability;
+        if (applyBlur) {
+            int passes = 1 + Random.Range(0, blurMaxExtraPasses + 1);
+            rt.filterMode = FilterMode.Bilinear;
+            var rtSmall = RenderTexture.GetTemporary(w / blurDownscale, h / blurDownscale, 0);
+            rtSmall.filterMode = FilterMode.Bilinear;
+
+            for (int pass = 0; pass < passes; pass++) {
+                Vector2 jitter = new Vector2(
+                    Random.Range(-blurJitterPixels, blurJitterPixels) / w,
+                    Random.Range(-blurJitterPixels, blurJitterPixels) / h
+                );
+                Graphics.Blit(rt, rtSmall, Vector2.one, jitter);
+                Graphics.Blit(rtSmall, rt);
+            }
+            RenderTexture.ReleaseTemporary(rtSmall);
+        }
+
+        // Randomized "jagged" pass: nearest-neighbor downscale-upscale produces
+        // the hard, blocky pixel boundaries that non-AA renderers produce.
+        // Single fixed downscale, applied with probability jaggedAugmentProbability.
+        bool applyJagged = jaggedDownscale > 1 && Random.value < jaggedAugmentProbability;
+        if (applyJagged) {
+            rt.filterMode = FilterMode.Point;
+            var rtSmall = RenderTexture.GetTemporary(w / jaggedDownscale, h / jaggedDownscale, 0);
+            rtSmall.filterMode = FilterMode.Point;
+            Vector2 jitter = new Vector2(
+                Random.Range(-jaggedJitterPixels, jaggedJitterPixels) / w,
+                Random.Range(-jaggedJitterPixels, jaggedJitterPixels) / h
+            );
+            Graphics.Blit(rt, rtSmall, Vector2.one, jitter);
+            Graphics.Blit(rtSmall, rt);
+            RenderTexture.ReleaseTemporary(rtSmall);
+            rt.filterMode = FilterMode.Bilinear;
+        }
 
         RenderTexture.active = rt;
         var tex = new Texture2D(w, h, TextureFormat.RGB24, false);
@@ -519,7 +619,10 @@ public class Randomizer : MonoBehaviour {
         var cam = Camera.main;
         if (cam == null) return;
 
-        float distance = Random.Range(minDistance, maxDistance);
+        // Bias the distance toward minDistance by raising a uniform sample to
+        // a power before mapping. distanceBiasExponent > 1 = close bias.
+        float distanceT = Mathf.Pow(Random.value, distanceBiasExponent);
+        float distance = minDistance + (maxDistance - minDistance) * distanceT;
 
         // The gate's apparent half-size in viewport-Y units at this distance.
         // tan(VFoV/2) gives the half-extent of the viewport at unit depth, so
@@ -601,15 +704,35 @@ public class Randomizer : MonoBehaviour {
     public void RandomizeBackground() {
         if (cachedFiles == null || cachedFiles.Length == 0) Awake();
 
+        // Always wipe to a random solid color first; whichever path runs below
+        // can opt back in to its own visual on top.
         Camera.main.backgroundColor = new Color(Random.value, Random.value, Random.value, 1f);
 
-        if (Random.value < 0.25f) {
-            bgImage.enabled = false;
-            return;
+        // Pick which background style to use this frame.
+        float roll = Random.value;
+        float solidCutoff   = backgroundProbabilities.x;
+        float cocoCutoff    = backgroundProbabilities.x + backgroundProbabilities.y;
+        // (anything above cocoCutoff falls into the horizon bucket)
+
+        if (roll < solidCutoff) {
+            ShowSolidColorBackground();
+        } else if (roll < cocoCutoff) {
+            ShowCocoBackground();
+        } else {
+            ShowHorizonBackground();
         }
+    }
+
+    void ShowSolidColorBackground() {
+        if (bgImage != null)     bgImage.enabled = false;
+        if (horizonRoot != null) horizonRoot.gameObject.SetActive(false);
+    }
+
+    void ShowCocoBackground() {
+        if (horizonRoot != null) horizonRoot.gameObject.SetActive(false);
+        if (bgImage == null) return;
 
         bgImage.enabled = true;
-
         string randomPath = cachedFiles[Random.Range(0, cachedFiles.Length)];
         byte[] data = File.ReadAllBytes(randomPath);
         Texture2D imageTex = new Texture2D(2, 2);
@@ -621,6 +744,35 @@ public class Randomizer : MonoBehaviour {
             new Vector2(0.5f, 0.5f)
         );
         bgImage.sprite = imageSprite;
+    }
+
+    void ShowHorizonBackground() {
+        if (bgImage != null) bgImage.enabled = false;
+        if (horizonRoot == null || horizonRoot.childCount < 2) return;
+
+        var sky    = horizonRoot.GetChild(0).GetComponent<Image>();
+        var ground = horizonRoot.GetChild(1).GetComponent<Image>();
+        if (sky == null || ground == null) return;
+
+        horizonRoot.gameObject.SetActive(true);
+
+        // Random sky / ground colors. Sample independently from full RGB so the
+        // model sees plenty of varied "sky over ground" colorings.
+        sky.color    = new Color(Random.value, Random.value, Random.value, 1f);
+        ground.color = new Color(Random.value, Random.value, Random.value, 1f);
+
+        // Random horizon position. The two children are stacked top/bottom
+        // inside horizonRoot; moving horizonRoot vertically shifts where the
+        // horizon line sits on screen. Range covers most of the viewport.
+        var canvasRect = horizonRoot.parent as RectTransform;
+        float canvasH = canvasRect != null ? canvasRect.rect.height : Screen.height;
+        float yOffset = Random.Range(-canvasH * 0.35f, canvasH * 0.35f);
+        horizonRoot.anchoredPosition = new Vector2(0f, yOffset);
+
+        // Random rotation so the horizon line isn't always perfectly level.
+        // Keep it modest — ±25° is plenty for training variety without making
+        // the scene unphysical.
+        horizonRoot.localRotation = Quaternion.Euler(0f, 0f, Random.Range(-25f, 25f));
     }
 
     // --- Editor visualization ----------------------------------------------

@@ -64,11 +64,13 @@ public class TrainingLabelWriter : MonoBehaviour {
             Vector3 cornerWorld = cornerT.position;
             float signedDist = Vector3.Dot(cornerWorld - gateCenterWorld, depthNormalWorld);
             Vector3 mirrored = cornerWorld - 2f * signedDist * depthNormalWorld;
-            Vector3 chosen = (cornerWorld - cam.transform.position).sqrMagnitude
-                           < (mirrored - cam.transform.position).sqrMagnitude ? cornerWorld : mirrored;
-            cornerT.position = chosen;
-
-            Vector3 world = chosen;
+            // Choose whichever copy is closer to the camera (= front face).
+            // CRITICAL: do NOT write `chosen` back to cornerT.position. That
+            // would permanently move the corner Transform every frame and
+            // accumulate drift over thousands of randomizations.
+            Vector3 world = (cornerWorld - cam.transform.position).sqrMagnitude
+                          < (mirrored - cam.transform.position).sqrMagnitude
+                          ? cornerWorld : mirrored;
             Vector3 screen = cam.WorldToScreenPoint(world);
             kp.onScreen = screen.z > 0
                        && screen.x >= 0 && screen.x < cam.pixelWidth

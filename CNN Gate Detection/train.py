@@ -27,9 +27,12 @@ if __name__ == "__main__":
     results = model.train(
         data="data.yaml",   # dataset config in this folder
         epochs=100,
-        imgsz=640,          # competition camera feed is 640x360; YOLO pads to square
-        batch=16,           # lower this (e.g. 4) if you run out of memory on CPU
+        imgsz=640,          # matches sim's 640x360 inference; bigger would blow latency budget
+        batch=16,
+        workers=0,
         device=device,
+        pose=30.0,
+        multi_scale=True,
         patience=20,        # early-stop if val metrics plateau for 20 epochs
         project="runs",     # output folder
         name="gate-pose",   # runs/gate-pose/

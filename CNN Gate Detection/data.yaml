@@ -7,7 +7,7 @@ val: ValidationImages
 # Keypoints: 8 corners per gate (inner + outer), 3 values each (x, y, visibility)
 kpt_shape: [8, 3]
 
-sigmas: [0.025, 0.025, 0.025, 0.025, 0.025, 0.025, 0.025, 0.025]  # inner stricter, outer looser
+sigmas: [0.025, 0.025, 0.025, 0.025, 0.025, 0.025, 0.025, 0.025] 
 
 # Corner order: TL, TR, BL, BR, TL_out, TR_out, BL_out, BR_out.
 # Horizontal flip swaps left<->right within each row (inner and outer).
